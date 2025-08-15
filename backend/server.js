@@ -38,6 +38,7 @@ app.use('/user', userRoutes.router); // Use .router since it exports { router }
 
 // Start server
 const PORT = process.env.PORT || 3000;
+app.get('/', (req, res) => res.send('SafeHer Backend Running'));
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
