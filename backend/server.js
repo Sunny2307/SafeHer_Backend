@@ -11,6 +11,7 @@ const http = require('http');
 const socketIo = require('socket.io');
 const jwt = require('jsonwebtoken');
 const { db } = require('./firebase');
+const pushNotificationService = require('./pushNotificationService');
 
 const app = express();
 const server = http.createServer(app);
@@ -26,26 +27,66 @@ const upload = multer({ dest: 'uploads/' });
 app.use(cors());
 app.use(express.json());
 
-// Serve static files from public directory
-app.use('/videos', express.static('public/videos'));
+// Static file serving removed - using Cloudinary only
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
 
 // Video Upload Route
 app.post('/upload-video', upload.single('video'), async (req, res) => {
   try {
+    if (!req.file) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'No video file provided' 
+      });
+    }
+
     const filePath = req.file.path;
     const fileName = `recording_${Date.now()}.mp4`;
+    
+    console.log(`Starting upload for file: ${fileName}, size: ${req.file.size} bytes`);
 
     const result = await uploadVideo(filePath, fileName);
-    fs.unlinkSync(filePath); // Clean up temporary file
+    
+    // Clean up temporary file
+    try {
+      fs.unlinkSync(filePath);
+      console.log('Temporary file cleaned up');
+    } catch (cleanupError) {
+      console.warn('Failed to clean up temporary file:', cleanupError.message);
+    }
 
+    console.log('Upload successful:', result.url);
     res.json({ 
       success: true, 
       videoUrl: result.url,
-      provider: result.provider 
+      provider: result.provider,
+      fileSize: req.file.size
     });
   } catch (error) {
     console.error('Upload error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    
+    // Clean up temporary file on error
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (cleanupError) {
+        console.warn('Failed to clean up temporary file after error:', cleanupError.message);
+      }
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -56,6 +97,9 @@ app.use('/user', userRoutes.router); // Use .router since it exports { router }
 
 // Store active location sharing sessions
 const activeLocationSessions = new Map();
+
+// Store device tokens for push notifications
+const deviceTokens = new Map();
 
 // WebSocket authentication middleware
 io.use(async (socket, next) => {
@@ -79,33 +123,74 @@ io.on('connection', (socket) => {
   
   // Join user to their personal room
   socket.join(socket.userId);
+
+  // Handle device token registration for push notifications
+  socket.on('register-device-token', (data) => {
+    try {
+      const { deviceToken } = data;
+      deviceTokens.set(socket.userId, deviceToken);
+      console.log(`Device token registered for user ${socket.userId}`);
+    } catch (error) {
+      console.error('Error registering device token:', error);
+    }
+  });
   
   // Handle starting live location sharing
   socket.on('start-live-location', async (data) => {
     try {
-      const { friendPhoneNumber, duration = 3600000 } = data; // Default 1 hour
+      const { friendPhoneNumbers, duration = 3600000 } = data; // Support multiple friends
       const sessionId = `${socket.userId}_${Date.now()}`;
+      
+      // Ensure friendPhoneNumbers is an array
+      const recipients = Array.isArray(friendPhoneNumbers) ? friendPhoneNumbers : [friendPhoneNumbers];
       
       // Store session info
       activeLocationSessions.set(sessionId, {
         sharerId: socket.userId,
-        friendPhoneNumber,
+        friendPhoneNumbers: recipients,
         startTime: Date.now(),
         duration,
         isActive: true
       });
       
-      // Join friend to the session room
+      // Join the session room
       socket.join(`session_${sessionId}`);
       
-      // Notify friend if they're online
-      socket.to(friendPhoneNumber).emit('live-location-started', {
-        sessionId,
-        sharerId: socket.userId,
-        duration
+      // Notify all friends via socket and push notifications
+      const friendTokens = [];
+      recipients.forEach(friendPhoneNumber => {
+        // Send socket notification
+        socket.to(friendPhoneNumber).emit('live-location-started', {
+          sessionId,
+          sharerId: socket.userId,
+          duration
+        });
+
+        // Get device token for push notification
+        const friendToken = deviceTokens.get(friendPhoneNumber);
+        if (friendToken) {
+          friendTokens.push(friendToken);
+        }
       });
+
+      // Send push notifications to all friends
+      if (friendTokens.length > 0) {
+        try {
+          await pushNotificationService.sendLiveLocationRequestToMultiple(
+            friendTokens,
+            socket.userId, // Using userId as sharer name for now
+            sessionId
+          );
+          console.log(`Push notifications sent to ${friendTokens.length} friends`);
+        } catch (error) {
+          console.error('Error sending push notifications:', error);
+        }
+      }
       
-      socket.emit('live-location-session-created', { sessionId });
+      socket.emit('live-location-session-created', { 
+        sessionId,
+        recipients: recipients.length
+      });
       
       // Auto-expire session after duration
       setTimeout(() => {

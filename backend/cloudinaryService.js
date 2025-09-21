@@ -18,6 +18,15 @@ const uploadToCloudinary = async (filePath, fileName) => {
       public_id: `video_${Date.now()}`,
       overwrite: true,
       invalidate: true,
+      // Optimize for faster upload and processing
+      eager: [
+        { width: 720, height: 480, crop: 'scale', quality: 'auto' },
+        { width: 480, height: 320, crop: 'scale', quality: 'auto' }
+      ],
+      eager_async: true, // Process transformations asynchronously for faster upload
+      quality: 'auto:low', // Optimize quality for faster processing
+      fetch_format: 'auto', // Let Cloudinary choose the best format
+      flags: 'progressive', // Enable progressive upload
     });
     
     console.log('Cloudinary upload successful:', result.secure_url);
