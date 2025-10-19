@@ -1,13 +1,27 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
+const twilio = require('twilio');
+const crypto = require('crypto');
 const { db } = require('../firebase');
 require('dotenv').config();
 
 const router = express.Router();
 
-const TWO_FACTOR_API_KEY = process.env.TWO_FACTOR_API_KEY;
-const TWO_FACTOR_BASE_URL = 'https://2factor.in/API/V1';
+// Twilio Verify configuration
+const {
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  TWILIO_VERIFY_SERVICE_SID,
+} = process.env;
+
+const twilioClient = (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN)
+  ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+  : null;
+
+// In-memory mapping from a generated sessionId to the E.164 phone number
+// This keeps the existing frontend API unchanged (it still sends sessionId + otp)
+const otpSessionMap = new Map();
 
 // Check if user exists
 router.post('/checkUser', async (req, res) => {
@@ -28,7 +42,7 @@ router.post('/checkUser', async (req, res) => {
   }
 });
 
-// Send OTP using 2Factor.in
+// Send OTP using Twilio Verify (SMS)
 router.post('/send-otp', async (req, res) => {
   const { phoneNumber } = req.body;
 
@@ -39,43 +53,68 @@ router.post('/send-otp', async (req, res) => {
   const fullPhoneNumber = `+91${phoneNumber}`;
 
   try {
-    const response = await axios.get(
-      `${TWO_FACTOR_BASE_URL}/${TWO_FACTOR_API_KEY}/SMS/${fullPhoneNumber}/AUTOGEN`
-    );
-
-    if (response.data.Status === 'Success') {
-      const sessionId = response.data.Details;
-      res.status(200).json({ sessionId });
-    } else {
-      throw new Error('Failed to send OTP');
+    if (!twilioClient || !TWILIO_VERIFY_SERVICE_SID) {
+      return res.status(500).json({ error: 'OTP service not configured' });
     }
+
+    // Initiate Twilio Verify SMS
+    await twilioClient.verify.v2.services(TWILIO_VERIFY_SERVICE_SID)
+      .verifications
+      .create({ to: fullPhoneNumber, channel: 'sms' });
+
+    // Generate a sessionId to keep API compatible with the frontend
+    const sessionId = (crypto.randomUUID && crypto.randomUUID())
+      || `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    otpSessionMap.set(sessionId, fullPhoneNumber);
+
+    res.status(200).json({ sessionId });
   } catch (error) {
-    console.error('Error sending OTP:', error.message);
+    console.error('Error sending OTP via Twilio:', error.message || error);
     res.status(500).json({ error: 'Failed to send OTP' });
   }
 });
 
-// Verify OTP using 2Factor.in
+// Verify OTP using Twilio Verify
 router.post('/verify-otp', async (req, res) => {
-  const { sessionId, otp } = req.body;
+  const { sessionId, otp, phoneNumber } = req.body;
 
-  if (!sessionId || !otp) {
-    return res.status(400).json({ error: 'Session ID and OTP are required' });
+  if ((!sessionId && !phoneNumber) || !otp) {
+    return res.status(400).json({ error: 'Session ID or phone number and OTP are required' });
   }
 
   try {
-    const response = await axios.get(
-      `${TWO_FACTOR_BASE_URL}/${TWO_FACTOR_API_KEY}/SMS/VERIFY/${sessionId}/${otp}`
-    );
-
-    if (response.data.Status === 'Success') {
-      res.status(200).json({ message: 'OTP verified successfully' });
-    } else {
-      throw new Error('Invalid OTP');
+    if (!twilioClient || !TWILIO_VERIFY_SERVICE_SID) {
+      return res.status(500).json({ error: 'OTP service not configured' });
     }
+
+    let toPhone = null;
+    if (sessionId) {
+      toPhone = otpSessionMap.get(sessionId) || null;
+    }
+    if (!toPhone && phoneNumber) {
+      const trimmed = String(phoneNumber).replace(/\D/g, '').slice(-10);
+      if (trimmed.length === 10) {
+        toPhone = `+91${trimmed}`;
+      }
+    }
+    if (!toPhone) {
+      return res.status(400).json({ error: 'Invalid or expired session or phone number' });
+    }
+
+    const check = await twilioClient.verify.v2.services(TWILIO_VERIFY_SERVICE_SID)
+      .verificationChecks
+      .create({ to: toPhone, code: otp });
+
+    if (check.status === 'approved') {
+      // OTP was correct; we can remove the session mapping
+      if (sessionId) otpSessionMap.delete(sessionId);
+      return res.status(200).json({ message: 'OTP verified successfully' });
+    }
+
+    return res.status(400).json({ error: 'Invalid OTP', status: check.status });
   } catch (error) {
-    console.error('Error verifying OTP:', error.message);
-    res.status(400).json({ error: 'Invalid OTP' });
+    console.error('Error verifying OTP via Twilio:', error?.message || error);
+    res.status(400).json({ error: error?.message || 'OTP verification failed' });
   }
 });
 

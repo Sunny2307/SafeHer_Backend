@@ -20,6 +20,7 @@
     "googleapis": "^150.0.1",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.1",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "twilio": "^5.3.0"
   }
 }
